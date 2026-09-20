@@ -281,7 +281,7 @@ describe("createOpenClawCodingTools availability guidance", () => {
         'Accepted results report target admission as `targetDisposition: "queued"` or `"steered"`; `delivery.status` is only later announcement state, and neither proves target completion.',
         "mode:notify queues ephemeral context for the next turn without waking or starting work (bounded process memory, not a durable inbox). mode:steer injects guidance into an active supported run and never starts idle work; mode:followup starts or queues a later turn without steering. mode:resume continues your paused native child task; returns runId/taskRunId, with completion from the task owner, not inline. Resume rejects watch:true and positive timeoutSeconds. Omit mode for existing automatic routing.",
         "For an exact external destination, use `conversations_list` plus `conversations_send`/`conversations_turn`.",
-        'Thread chats rejected: target parent channel. Missing configured-agent main created. Waits for reply when available; status "no_reply" is terminal, so do not wait for an announcement.',
+        'Thread chats allowed: your turn stays out of that thread unless you call `message`. Missing configured-agent main created. Waits for reply when available; status "no_reply" is terminal, so do not wait for an announcement.',
         "watch:true: notice arrives when others later change target session.",
       ].join(" "),
     );
