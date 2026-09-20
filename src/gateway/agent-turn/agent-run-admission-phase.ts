@@ -85,6 +85,8 @@ export type PreparedAgentRunDispatch = {
   lifecycleStorePath: string;
   resolvedThreadId?: string | number;
   dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent">;
+  /** The spawn turn owning the replacement `acp` task row; its requester wake is subagent_settle. */
+  confirmedAcpManualSpawn: boolean;
   preparedModelRuntimeLease: PreparedModelRuntimeLease;
   replyDispatchRuntime: PreparedReplyDispatchRuntime;
   unpersistedOffloadedRefs: OffloadedRef[];
@@ -467,7 +469,7 @@ export async function prepareAgentRunDispatch(params: {
   } catch (err) {
     return rejectPreaccept(errorShapeFromError(ErrorCodes.UNAVAILABLE, err));
   }
-  const { taskTrackingMode, adoptParentResume } = taskTracking;
+  const { taskTrackingMode, confirmedAcpManualSpawn, adoptParentResume } = taskTracking;
   let restoreAdmittedRestartRecoveryInterrupted:
     | (() => Promise<MainSessionRecoveryPendingTarget | undefined>)
     | undefined;
@@ -689,6 +691,7 @@ export async function prepareAgentRunDispatch(params: {
       lifecycleStorePath,
       resolvedThreadId,
       dispatchTaskTrackingMode: taskTrackingMode === "plugin_subagent" ? "none" : taskTrackingMode,
+      confirmedAcpManualSpawn,
       preparedModelRuntimeLease,
       replyDispatchRuntime,
       unpersistedOffloadedRefs: userTurn.recorder ? [] : params.offloadedRefs,
