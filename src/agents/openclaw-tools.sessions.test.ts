@@ -26,13 +26,10 @@ import {
 } from "../infra/system-events.js";
 import { createSessionVisibilityChecker } from "../plugin-sdk/session-visibility.js";
 import {
-  GatewayDrainingError,
   getActiveGatewayRootWorkCount,
-  isGatewaySubordinateWorkAdmissionClosed,
   resetGatewayWorkAdmission,
 } from "../process/gateway-work-admission.js";
 import { runWithGatewayRootWorkAdmissionForTest } from "../process/gateway-work-admission.test-helpers.js";
-import { isCompletionReportInputProvenance } from "../sessions/input-provenance.js";
 import { disposeOpenClawAgentDatabaseByPath } from "../state/openclaw-agent-db.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";
 
@@ -217,15 +214,6 @@ function getSessionTool(
 function cloneTestConfig() {
   return { ...TEST_CONFIG, session: { ...TEST_CONFIG.session } };
 }
-
-const waitForCalls = async (getCount: () => number, count: number, timeoutMs = 2000) => {
-  await vi.waitFor(
-    () => {
-      expect(getCount()).toBeGreaterThanOrEqual(count);
-    },
-    { timeout: timeoutMs, interval: 5 },
-  );
-};
 
 type GatewayCall = {
   method?: string;
@@ -1286,10 +1274,12 @@ describe("sessions tools", () => {
     expect(fireDetails.status).toBe("accepted");
     expect(fireDetails.runId).toBe("run-1");
     expect(fireDetails.targetDisposition).toBe("queued");
-    expect(fireDetails.delivery?.status).toBe("pending");
+    // Fire-and-forget never registers the reply/announce flow: the target run is
+    // the only work started, and nothing waits on it to wake the requester.
+    expect(fireDetails.delivery?.status).toBe("skipped");
     expect(fireDetails.delivery?.mode).toBe("announce");
-    await waitForCalls(() => agentCallCount, 3);
-    await waitForCalls(() => waitCallCount, 3);
+    expect(agentCallCount).toBe(1);
+    expect(waitCallCount).toBe(0);
 
     const waitPromise = tool.execute("call6", {
       sessionKey: "main",
@@ -1300,7 +1290,8 @@ describe("sessions tools", () => {
     const waitedDetails = sessionsSendDetails(waited.details);
     expect(waitedDetails.status).toBe("ok");
     expect(waitedDetails.reply).toBe("done");
-    expect(waitedDetails.delivery?.status).toBe("pending");
+    // The inline reply is the whole result: nothing announces it back.
+    expect(waitedDetails.delivery?.status).toBe("skipped");
     expect(waitedDetails.delivery?.mode).toBe("announce");
     expect(typeof (waited.details as { runId?: string }).runId).toBe("string");
     expect(tool.outputSchema).toBeDefined();
@@ -1348,13 +1339,16 @@ describe("sessions tools", () => {
     expect(declaration).toContain('targetDisposition: "queued" | "steered"');
     expect(declaration).toContain('status: "no_reply"');
     expect(declaration).toContain('status: "timeout"');
-    await waitForCalls(() => agentCallCount, 6);
-    await waitForCalls(() => waitCallCount, 6);
+    // Neither send registers a reply flow, so no further calls can arrive.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 25);
+    });
 
     const agentCalls = calls.filter((call) => call.method === "agent");
     const waitCalls = calls.filter((call) => call.method === "agent.wait");
     const historyOnlyCalls = calls.filter((call) => call.method === "chat.history");
-    expect(agentCalls).toHaveLength(6);
+    // One target run per send, and no reply or announce step for either.
+    expect(agentCalls).toHaveLength(2);
     for (const call of agentCalls) {
       expectInterSessionAgentCall(call);
     }
@@ -1386,15 +1380,13 @@ describe("sessions tools", () => {
       sourceTool: "sessions_send",
     });
     expect(
-      agentCalls.some(
-        (call) =>
-          typeof (call.params as { extraSystemPrompt?: string })?.extraSystemPrompt === "string" &&
-          (call.params as { extraSystemPrompt?: string })?.extraSystemPrompt?.includes(
-            "Agent-to-agent reply step",
-          ),
+      agentCalls.some((call) =>
+        agentParams(call).extraSystemPrompt?.includes("Agent-to-agent reply step"),
       ),
-    ).toBe(true);
-    expect(waitCalls).toHaveLength(6);
+    ).toBe(false);
+    // The fire-and-forget send never waits on its target run; the waited send
+    // waits once, inline.
+    expect(waitCalls).toHaveLength(1);
     expect(historyOnlyCalls).toHaveLength(0);
     expect(sendCallCount).toBe(0);
   });
@@ -1725,11 +1717,13 @@ describe("sessions tools", () => {
     expect(details.error).toBe("429 RESOURCE_EXHAUSTED");
     expect(details.runId).toBe("run-pending-model-error");
     expect(details.sentBeforeError).toBe(true);
-    expect(details.delivery?.status).toBe("pending");
+    // The retrying run keeps going in its own session; no announcement follows it.
+    expect(details.delivery?.status).toBe("skipped");
     expect(calls.filter((call) => call.method === "agent")).toHaveLength(1);
-    await vi.waitFor(() =>
-      expect(calls.filter((call) => call.method === "agent.wait").length).toBeGreaterThanOrEqual(2),
-    );
+    await new Promise((resolve) => {
+      setTimeout(resolve, 25);
+    });
+    expect(calls.filter((call) => call.method === "agent.wait")).toHaveLength(1);
   });
 
   it("sessions_send resolves sessionId inputs", async () => {
@@ -1771,127 +1765,13 @@ describe("sessions tools", () => {
     expect(request.params?.sessionKey).toBe(targetKey);
   });
 
-  it("sessions_send runs ping-pong then announces", async () => {
-    const calls: Array<{ method?: string; params?: unknown }> = [];
-    let agentCallCount = 0;
-    const replyByRunId = new Map<string, string>();
-    const requesterKey = "agent:main:whatsapp:group:req";
-    const targetKey = "agent:director1:discord:group:target";
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string; params?: unknown };
-      calls.push(request);
-      if (request.method === "agent") {
-        agentCallCount += 1;
-        const runId = `run-${agentCallCount}`;
-        const params = agentParams(request);
-        let reply = "initial";
-        if (params.extraSystemPrompt?.includes("Agent-to-agent reply step")) {
-          reply = params.sessionKey === requesterKey ? "pong-1" : "pong-2";
-        }
-        replyByRunId.set(runId, reply);
-        return { runId, status: "accepted" };
-      }
-      if (request.method === "agent.wait") {
-        const params = request.params as { runId?: string } | undefined;
-        const runId = params?.runId ?? "run-1";
-        return {
-          runId,
-          status: "ok",
-          terminalReply: { disposition: "visible", text: replyByRunId.get(runId) },
-        };
-      }
-      return {};
-    });
-    agentStepTesting.setDepsForTest({
-      agentCommandFromIngress: async () => ({
-        payloads: [{ text: "announce now", mediaUrl: null }],
-        meta: { durationMs: 1 },
-      }),
-    });
-
-    const tool = getSessionTool("sessions_send", {
-      agentSessionKey: requesterKey,
-      agentChannel: "whatsapp",
-    });
-
-    const waited = await tool.execute("call7", {
-      sessionKey: targetKey,
-      message: "ping",
-      timeoutSeconds: 1,
-    });
-    const waitedDetails = sessionsSendDetails(waited.details);
-    expect(waitedDetails.status).toBe("ok");
-    expect(waitedDetails.reply).toBe("initial");
-    await waitForCalls(() => countMatching(calls, (call) => call.method === "send"), 1);
-
-    const agentCalls = calls.filter((call) => call.method === "agent");
-    expect(agentCalls).toHaveLength(6);
-    for (const call of agentCalls) {
-      const params = agentParams(call);
-      expect(params.lane).toMatch(/^nested(?::|$)/);
-      expect(params.channel).toBe("webchat");
-      expect(params.inputProvenance?.kind).toBe("inter_session");
-      expect(params.inputProvenance?.sourceRole).toBeUndefined();
-    }
-
-    const replySteps = agentCalls.filter((call) =>
-      agentParams(call).extraSystemPrompt?.includes("Agent-to-agent reply step"),
-    );
-    expect(replySteps).toHaveLength(5);
-    const requesterStep = {
-      agentId: "main",
-      sessionKey: requesterKey,
-      inputProvenance: {
-        sourceSessionKey: targetKey,
-        sourceChannel: "discord",
-        sourceTool: "sessions_send",
-      },
-      extraSystemPrompt: expect.stringContaining("Current agent: Agent 1 (requester)."),
-    };
-    const targetStep = {
-      agentId: "director1",
-      sessionKey: targetKey,
-      inputProvenance: {
-        sourceSessionKey: requesterKey,
-        sourceChannel: "whatsapp",
-        sourceTool: "sessions_send",
-      },
-      extraSystemPrompt: expect.stringContaining("Current agent: Agent 2 (target)."),
-    };
-    expect(replySteps.map((step) => step.params)).toMatchObject([
-      { ...requesterStep, message: expect.stringContaining("initial") },
-      { ...targetStep, message: expect.stringContaining("pong-1") },
-      { ...requesterStep, message: expect.stringContaining("pong-2") },
-      { ...targetStep, message: expect.stringContaining("pong-1") },
-      { ...requesterStep, message: expect.stringContaining("pong-2") },
-    ]);
-    const announcements = calls.filter((call) => call.method === "send");
-    expect(announcements).toHaveLength(1);
-    expect(announcements[0]?.params).toMatchObject({
-      to: "group:target",
-      channel: "discord",
-      message: "announce now",
-    });
-  });
-
-  it.each<{
-    targetKind: string;
-    targetKey: string;
-    spawned: boolean;
-    timeoutSeconds?: number;
-    pendingError?: boolean;
-    failure?: string;
-    stopReason?: string;
-    cronRequester?: boolean;
-  }>([
-    { targetKind: "peer", targetKey: "agent:director1:main", spawned: false },
-    { targetKind: "visible child", targetKey: "agent:director1:dashboard:child", spawned: true },
-    { targetKind: "hidden child", targetKey: "agent:director1:subagent:child", spawned: true },
+  it.each([
+    { targetKind: "peer", targetKey: "agent:director1:main", spawned: false, pendingError: false },
     {
-      targetKind: "nonblocking child",
+      targetKind: "child",
       targetKey: "agent:director1:subagent:child",
       spawned: true,
-      timeoutSeconds: 0,
+      pendingError: false,
     },
     {
       targetKind: "retrying child",
@@ -1899,51 +1779,11 @@ describe("sessions tools", () => {
       spawned: true,
       pendingError: true,
     },
-    {
-      targetKind: "failed child",
-      targetKey: "agent:director1:subagent:child",
-      spawned: true,
-      failure: "child run failed",
-    },
-    {
-      targetKind: "failed retrying child",
-      targetKey: "agent:director1:subagent:child",
-      spawned: true,
-      pendingError: true,
-      failure: "child retry exhausted",
-    },
-    {
-      targetKind: "cancelled child",
-      targetKey: "agent:director1:subagent:child",
-      spawned: true,
-      failure: "child run cancelled",
-      stopReason: "aborted",
-    },
-    ...["dashboard", "subagent"].flatMap((kind) =>
-      [0, 1].flatMap((timeoutSeconds) =>
-        [false, true].map((failed) => ({
-          targetKind: `${kind} child of Cron, timeout=${timeoutSeconds}, failed=${failed}`,
-          targetKey: `agent:director1:${kind}:child`,
-          spawned: true,
-          cronRequester: true,
-          timeoutSeconds,
-          failure: failed ? "Cron child run failed" : undefined,
-        })),
-      ),
-    ),
   ])(
-    "sessions_send delivers the late reply from a $targetKind after the parent root releases",
-    async ({
-      targetKey,
-      spawned,
-      timeoutSeconds = 1,
-      pendingError,
-      failure,
-      stopReason,
-      cronRequester = false,
-    }) => {
+    "sessions_send leaves a late reply from a $targetKind with its own session",
+    async ({ targetKey, spawned, pendingError }) => {
       const calls: Array<{ method?: string; params?: unknown }> = [];
-      const requesterKey = cronRequester ? "agent:main:cron:job:run:once" : "agent:main:main";
+      const requesterKey = "agent:main:main";
       if (spawned) {
         await upsertSessionEntryCore(
           { agentId: "director1", sessionKey: targetKey },
@@ -1956,9 +1796,7 @@ describe("sessions tools", () => {
         releaseDelayedWait = resolve;
       });
       let requesterProviderStarts = 0;
-      let requesterAdmissionClosed: boolean | undefined;
-      let finalAnnounceProviderStarts = 0;
-      let finalAnnounceAdmissionClosed: boolean | undefined;
+      let announceProviderStarts = 0;
       callGatewayMock.mockImplementation(async (opts: unknown) => {
         const request = opts as { method?: string; params?: unknown };
         calls.push(request);
@@ -1968,10 +1806,6 @@ describe("sessions tools", () => {
             return { runId: "run-target", status: "accepted", acceptedAt: 2000 };
           }
           if (params?.sessionKey === requesterKey) {
-            requesterAdmissionClosed = isGatewaySubordinateWorkAdmissionClosed();
-            if (requesterAdmissionClosed) {
-              throw new GatewayDrainingError();
-            }
             requesterProviderStarts += 1;
             return { runId: "run-requester", status: "accepted", acceptedAt: 2001 };
           }
@@ -1980,7 +1814,7 @@ describe("sessions tools", () => {
           const params = request.params as { runId?: string } | undefined;
           if (params?.runId === "run-target") {
             targetWaitCount += 1;
-            if (timeoutSeconds !== 0 && targetWaitCount === 1) {
+            if (targetWaitCount === 1) {
               return {
                 runId: "run-target",
                 status: "timeout",
@@ -1988,34 +1822,18 @@ describe("sessions tools", () => {
               };
             }
             await delayedWaitGate;
-            if (failure) {
-              return { runId: "run-target", status: "error", error: failure, stopReason };
-            }
             return {
               runId: "run-target",
               status: "ok",
               terminalReply: { disposition: "visible", text: "late director reply" },
             };
           }
-          if (params?.runId === "run-requester") {
-            return {
-              runId: "run-requester",
-              status: "ok",
-              terminalReply: { disposition: "visible", text: "requester saw director" },
-            };
-          }
         }
         return {};
       });
       agentStepTesting.setDepsForTest({
-        agentCommandFromIngress: async (opts) => {
-          expect(opts.sessionKey).toBe(targetKey);
-          expect(opts.extraSystemPrompt).toContain("Agent-to-agent announce step");
-          finalAnnounceAdmissionClosed = isGatewaySubordinateWorkAdmissionClosed();
-          if (finalAnnounceAdmissionClosed) {
-            throw new GatewayDrainingError();
-          }
-          finalAnnounceProviderStarts += 1;
+        agentCommandFromIngress: async () => {
+          announceProviderStarts += 1;
           return {
             payloads: [{ text: "ANNOUNCE_SKIP", mediaUrl: null }],
             meta: { durationMs: 1 },
@@ -2033,7 +1851,7 @@ describe("sessions tools", () => {
         tool.execute("call-delayed", {
           sessionKey: targetKey,
           message: "ping",
-          timeoutSeconds,
+          timeoutSeconds: 1,
         }),
       );
       const details = sessionsSendDetails(result.details);
@@ -2042,62 +1860,21 @@ describe("sessions tools", () => {
       if (!pendingError) {
         expect(details.targetDisposition).toBe("queued");
       }
-      expect(details.delivery?.status).toBe("pending");
+      // A waited send owns no detached work: the caller's root releases at once
+      // and the target's late reply stays in the target session.
+      expect(details.delivery?.status).toBe("skipped");
       expect(details.delivery?.mode).toBe("announce");
-      expect(getActiveGatewayRootWorkCount()).toBe(1);
-      expect(requesterProviderStarts).toBe(0);
+      expect(getActiveGatewayRootWorkCount()).toBe(0);
       releaseDelayedWait();
-
-      if (!cronRequester) {
-        await vi.waitFor(
-          () => {
-            expect(requesterAdmissionClosed).toBe(false);
-          },
-          { timeout: 2_000, interval: 5 },
-        );
-      }
-      await vi.waitFor(() => {
-        expect(getActiveGatewayRootWorkCount()).toBe(0);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
       });
-      expect(requesterProviderStarts).toBe(cronRequester ? 0 : spawned ? 1 : 3);
 
-      const requesterReplyCall = calls.find(
-        (call) =>
-          call.method === "agent" &&
-          (call.params as { sessionKey?: string } | undefined)?.sessionKey === requesterKey,
-      );
-      if (cronRequester) {
-        expect(requesterReplyCall).toBeUndefined();
-        expect(requesterAdmissionClosed).toBeUndefined();
-        expect(calls.filter((call) => call.method === "agent")).toHaveLength(1);
-      } else {
-        const replyParams = requesterReplyCall?.params as
-          | {
-              extraSystemPrompt?: string;
-              inputProvenance?: { sourceSessionKey?: string; sourceRole?: string };
-              message?: string;
-              sessionKey?: string;
-            }
-          | undefined;
-        expect(replyParams?.sessionKey).toBe(requesterKey);
-        expect(replyParams?.inputProvenance?.sourceSessionKey).toBe(targetKey);
-        expect(replyParams?.message).toContain(failure ?? "late director reply");
-        expect(replyParams?.inputProvenance?.sourceRole).toBe(spawned ? "subagent" : undefined);
-        expect(
-          isCompletionReportInputProvenance(replyParams?.inputProvenance),
-          "requested child results use the completion boundary so parent answers remain visible",
-        ).toBe(spawned);
-        if (spawned) {
-          expect(replyParams?.extraSystemPrompt).not.toContain("REPLY_SKIP");
-        } else {
-          expect(replyParams?.extraSystemPrompt).toContain("Agent-to-agent reply step");
-          expect(replyParams?.extraSystemPrompt).toContain("Current agent: Agent 1 (requester)");
-        }
-      }
+      expect(targetWaitCount).toBe(1);
+      expect(requesterProviderStarts).toBe(0);
+      expect(announceProviderStarts).toBe(0);
+      expect(calls.filter((call) => call.method === "agent")).toHaveLength(1);
       expect(calls.find((call) => call.method === "send")).toBeUndefined();
-      const announces = !spawned || (cronRequester && !failure);
-      expect(finalAnnounceAdmissionClosed).toBe(announces ? false : undefined);
-      expect(finalAnnounceProviderStarts).toBe(announces ? 1 : 0);
     },
   );
 
@@ -2327,10 +2104,8 @@ describe("sessions tools", () => {
     expect(params.sessionKey).toBe(durableCronCallerKey);
     expect(params.message).toContain("[Inter-session message]");
     expect(params.message).toContain("[TASK-COMPLETE] re-portal occupancy ready");
-    await waitForCalls(() => countMatching(calls, (call) => call.method === "agent.wait"), 1);
-    expect(calls.find((call) => call.method === "agent.wait")?.params).toMatchObject({
-      runId: "durable-fallback-run",
-    });
+    // Fire-and-forget: the accepted fallback run is never waited on or announced.
+    expect(calls.filter((call) => call.method === "agent.wait")).toHaveLength(0);
     expect(calls.filter((call) => call.method === "chat.history")).toHaveLength(0);
     expect(calls.filter((call) => call.method === "agent")).toHaveLength(1);
     expect
@@ -2577,126 +2352,6 @@ describe("sessions tools", () => {
     expect(details.error).toBe("agent failed");
     expect(details.sentBeforeError).toBe(true);
     expect(details.sessionKey).toBe(targetKey);
-  });
-
-  it("sessions_send preserves threadId when announce target is hydrated via sessions.list", async () => {
-    const calls: Array<{ method?: string; params?: unknown }> = [];
-    let agentCallCount = 0;
-    const replyByRunId = new Map<string, string>();
-    const requesterKey = "discord:group:req";
-    const targetKey = "agent:main:worker";
-    let sendParams: {
-      to?: string;
-      channel?: string;
-      accountId?: string;
-      message?: string;
-      threadId?: string;
-    } = {};
-
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string; params?: unknown };
-      calls.push(request);
-      if (request.method === "agent") {
-        agentCallCount += 1;
-        const runId = `run-${agentCallCount}`;
-        const params = request.params as
-          | {
-              sessionKey?: string;
-              extraSystemPrompt?: string;
-            }
-          | undefined;
-        let reply = "initial";
-        if (params?.extraSystemPrompt?.includes("Agent-to-agent reply step")) {
-          reply = params.sessionKey === requesterKey ? "pong-1" : "pong-2";
-        }
-        if (params?.extraSystemPrompt?.includes("Agent-to-agent announce step")) {
-          reply = "announce now";
-        }
-        replyByRunId.set(runId, reply);
-        return {
-          runId,
-          status: "accepted",
-          acceptedAt: 3000 + agentCallCount,
-        };
-      }
-      if (request.method === "agent.wait") {
-        const params = request.params as { runId?: string } | undefined;
-        const runId = params?.runId ?? "run-1";
-        return {
-          runId,
-          status: "ok",
-          terminalReply: { disposition: "visible", text: replyByRunId.get(runId) },
-        };
-      }
-      if (request.method === "sessions.list") {
-        return {
-          sessions: [
-            {
-              key: targetKey,
-              agentId: "main",
-              deliveryContext: {
-                channel: "whatsapp",
-                to: "123@g.us",
-                accountId: "work",
-                threadId: 99,
-              },
-            },
-          ],
-        };
-      }
-      if (request.method === "send") {
-        const params = request.params as
-          | {
-              to?: string;
-              channel?: string;
-              accountId?: string;
-              message?: string;
-              threadId?: string;
-            }
-          | undefined;
-        sendParams = {
-          to: params?.to,
-          channel: params?.channel,
-          accountId: params?.accountId,
-          message: params?.message,
-          threadId: params?.threadId,
-        };
-        return { messageId: "m-threaded-announce" };
-      }
-      return {};
-    });
-    agentStepTesting.setDepsForTest({
-      agentCommandFromIngress: async () => ({
-        payloads: [{ text: "announce now", mediaUrl: null }],
-        meta: { durationMs: 1 },
-      }),
-    });
-
-    const tool = getSessionTool("sessions_send", {
-      agentSessionKey: requesterKey,
-      agentChannel: "discord",
-    });
-
-    const waited = await tool.execute("call-thread", {
-      sessionKey: targetKey,
-      message: "ping",
-      timeoutSeconds: 1,
-    });
-    const waitedDetails = sessionsSendDetails(waited.details);
-    expect(waitedDetails.status).toBe("ok");
-    expect(waitedDetails.reply).toBe("initial");
-    await vi.waitFor(
-      () => {
-        expect(countMatching(calls, (call) => call.method === "send")).toBe(1);
-      },
-      { timeout: 2_000, interval: 5 },
-    );
-
-    expect(sendParams.to).toBe("123@g.us");
-    expect(sendParams.channel).toBe("whatsapp");
-    expect(sendParams.accountId).toBe("work");
-    expect(sendParams.message).toBe("announce now");
-    expect(sendParams.threadId).toBe("99");
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
